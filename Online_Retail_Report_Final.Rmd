@@ -1,0 +1,597 @@
+---
+title: "Online Retail: Customer Value and Retention Analysis"
+author: "Harshita Nese"
+date: "November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+# Show code and results, but hide package start-up messages and warnings
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5)
+
+library(tidyverse)   # dplyr, ggplot2, readr, stringr ...
+library(knitr)       # kable() for clean tables
+
+# Helper used in the text: turns "2011-11" into "November 2011"
+month_name <- function(x) format(as.Date(paste0(x, "-01")), "%B %Y")
+
+# One colour for all bar charts, so every figure looks consistent
+bar_colour <- "steelblue"
+```
+
+# Executive Summary
+
+This report analyses 541,909 transaction rows from a UK-based online retailer (1 December 2010 to 9 December 2011). It follows the CRISP-DM framework. Sales revenue is defined as Quantity × UnitPrice for genuine product sales, and cancellations are analysed separately. Revenue is not profit, because no cost data are available.
+
+**Key findings**
+
+- **Sales:** genuine product sales were worth £10.0 million from 19,771 invoices and 4,333 identified customers.
+- **Seasonality:** revenue peaks in November 2011 (£1.45 million), and September to November generate 35.8% of sales revenue. December 2011 is incomplete.
+- **Markets:** the United Kingdom generates 84.8% of revenue, and the next five markets add only 10.8%.
+- **Customers:** the top 20% of customers generate 73.9% of revenue. RFM segmentation shows that High Value customers are 21.7% of customers but 66.5% of revenue, and 34.7% of customers bought only once.
+- **Cancellations:** 14.7% of invoices are cancellations, but they remove only 2.3% of sales value.
+- **Data quality:** non-product codes and two orders cancelled within minutes had to be set aside, otherwise they would have appeared as best-selling products and top customers.
+- **Recommendations:** retain High Value customers, win back At Risk customers, turn one-time buyers into repeat customers, plan for the autumn peak and test growth in the largest export markets.
+
+AI assistance is documented in the sections marked **AI-Assisted**.
+
+# Business Understanding
+
+## Background and business problem
+
+The online retail industry generates large amounts of transaction data that can help a business understand customer behaviour, product performance and sales trends. This project uses the Online Retail dataset, which records invoice numbers, products, quantities, dates, unit prices, customer IDs and countries.
+
+The business needs a better understanding of its sales performance and customer purchasing behaviour. Without analysing its data, it may struggle to identify its best-performing products, recognise valuable customers, understand sales across countries and monitor cancellations. This project therefore turns the transaction data into practical business recommendations.
+
+## Objectives
+
+1. **Sales performance:** analyse monthly revenue and quantity to identify trends and seasonal patterns.
+2. **Product performance:** identify the products that contribute most to revenue and to units sold.
+3. **Country analysis:** compare countries to identify important markets and growth opportunities.
+4. **Customer analysis:** examine purchasing behaviour, identify high-value and repeat customers, and group customers with RFM analysis.
+5. **Cancellation analysis:** examine cancelled transactions and how cancellations change over time.
+6. **Recommendations:** use the findings to suggest actions for sales, retention and planning.
+
+## Analytical approach
+
+The project follows CRISP-DM (Cross-Industry Standard Process for Data Mining): business understanding, data understanding, data preparation, analysis and modelling, evaluation and deployment. R is used for cleaning, exploration and customer segmentation, and the findings feed a one-page Power BI dashboard for business decision-makers.
+
+# Data Understanding
+
+## Loading the data
+
+```{r load-data}
+# Import the dataset. It is called retail_raw to preserve the original data
+# before any changes are made. The CSV must be in the same folder as this file.
+retail_raw <- read_csv("OnlineRetail.csv", show_col_types = FALSE)
+
+glimpse(retail_raw)   # variable names, types and example values
+```
+
+The dataset has `r format(nrow(retail_raw), big.mark = ",")` rows and `r ncol(retail_raw)` variables. `InvoiceDate` is stored as text, and `CustomerID` is stored as a number even though it is an identifier, so both need converting.
+
+## Data diagnostics
+
+```{r diagnostics}
+# Stock codes that are not products (postage, fees, manual entries, vouchers)
+non_product_codes <- c("POST", "DOT", "M", "m", "C2", "D", "S", "B",
+                       "BANK CHARGES", "AMAZONFEE", "CRUK", "PADS")
+
+diagnostic_table <- tibble(
+  Check = c("Rows", "Exact duplicate rows", "Missing CustomerID", "Missing Description",
+            "Cancellation rows (InvoiceNo starts with C)", "Negative quantities",
+            "Zero unit prices", "Negative unit prices", "Non-product stock codes"),
+  Rows  = c(nrow(retail_raw),
+            sum(duplicated(retail_raw)),
+            sum(is.na(retail_raw$CustomerID)),
+            sum(is.na(retail_raw$Description)),
+            sum(str_detect(retail_raw$InvoiceNo, "^C")),
+            sum(retail_raw$Quantity < 0),
+            sum(retail_raw$UnitPrice == 0),
+            sum(retail_raw$UnitPrice < 0),
+            sum(retail_raw$StockCode %in% non_product_codes |
+                str_detect(retail_raw$StockCode, "^gift_")))
+) %>%
+  mutate(Share_pct = round(Rows / nrow(retail_raw) * 100, 2))
+
+kable(diagnostic_table, format.args = list(big.mark = ","),
+      caption = "Initial data quality checks (raw data)")
+```
+
+```{r diagnostic-numbers, include=FALSE}
+n_dup         <- diagnostic_table$Rows[2]
+n_missing_cid <- diagnostic_table$Rows[3]
+pct_missing_cid <- diagnostic_table$Share_pct[3]
+n_zero_price  <- diagnostic_table$Rows[7]
+n_nonproduct  <- diagnostic_table$Rows[9]
+```
+
+The checks show five issues. There are `r format(n_dup, big.mark = ",")` exact duplicate rows; `r format(n_missing_cid, big.mark = ",")` rows (`r pct_missing_cid`%) have no customer ID, so they cannot be used for customer analysis; `r format(n_zero_price, big.mark = ",")` rows have a zero price; `r format(n_nonproduct, big.mark = ",")` rows are non-product codes; and cancellations are marked by invoice numbers beginning with C.
+
+```{r evidence-tables}
+# The non-product codes found in the data
+retail_raw %>%
+  filter(StockCode %in% non_product_codes | str_detect(StockCode, "^gift_")) %>%
+  group_by(StockCode) %>%
+  summarise(Rows = n(), Example_description = first(Description), .groups = "drop") %>%
+  arrange(desc(Rows)) %>%
+  head(8) %>%
+  kable(caption = "Most common non-product codes")
+
+# The four rows with the largest quantities (ignoring plus or minus)
+retail_raw %>%
+  arrange(desc(abs(Quantity))) %>%
+  select(InvoiceNo, Description, Quantity, InvoiceDate, CustomerID) %>%
+  head(4) %>%
+  kable(caption = "Largest quantities in the raw data")
+```
+
+The largest quantities form two matched pairs: an order of 74,215 units and a cancellation of 74,215 units, and an order of 80,995 units and a matching cancellation. Each pair was entered and cancelled within minutes on the same day. They net to zero revenue, but if left in they would appear as the best-selling products and as the biggest customers, and they would inflate cancelled value.
+
+# Data Preparation
+
+## Cleaning steps
+
+The cleaning rules below follow from the diagnostics. Each step is applied to a new object, so the raw data stay unchanged.
+
+```{r prepare-data}
+# Step 1: remove exact duplicate rows
+retail_no_duplicates <- retail_raw %>%
+  distinct()
+
+# Step 2: correct formats and create the variables needed for analysis
+retail_no_duplicates <- retail_no_duplicates %>%
+  mutate(
+    # Remove extra spaces in product descriptions
+    Description = str_squish(Description),
+
+    # Convert to date-time. Original format: day/month/year hour:minute.
+    # tz = "UTC" keeps the times exactly as recorded.
+    InvoiceDate = as.POSIXct(InvoiceDate, format = "%d/%m/%Y %H:%M", tz = "UTC"),
+
+    # CustomerID is an identifier, not a number to calculate with
+    CustomerID = as.character(CustomerID),
+
+    # Flags used to split the data
+    is_cancellation  = str_detect(InvoiceNo, "^C"),
+    is_nonproduct    = StockCode %in% non_product_codes | str_detect(StockCode, "^gift_"),
+    is_reversed_bulk = abs(Quantity) %in% c(74215, 80995),
+
+    # Revenue of each line (negative for cancellations) and the month
+    Revenue = Quantity * UnitPrice,
+    Month   = format(InvoiceDate, "%Y-%m")
+  )
+
+# Step 3: split into three datasets. Every row goes into exactly one of them.
+
+# A. Genuine sales: positive quantity and price, real product
+retail_sales <- retail_no_duplicates %>%
+  filter(!is_nonproduct, !is_reversed_bulk,
+         !is_cancellation, Quantity > 0, UnitPrice > 0)
+
+# B. Cancellations of real products
+retail_cancellations <- retail_no_duplicates %>%
+  filter(!is_nonproduct, !is_reversed_bulk, is_cancellation)
+
+# C. Adjustments: non-product codes, the two reversed bulk orders, zero prices.
+#    These rows are kept for reference but not used in the sales analysis.
+retail_adjustments <- retail_no_duplicates %>%
+  filter(is_nonproduct | is_reversed_bulk |
+         (!is_cancellation & (Quantity <= 0 | UnitPrice <= 0)))
+
+# Sales and cancellations together, used for invoice-level checks
+retail_clean <- bind_rows(retail_sales, retail_cancellations)
+```
+
+## Checks on the cleaned data
+
+```{r preparation-log}
+preparation_log <- tibble(
+  Dataset = c("retail_raw", "retail_no_duplicates", "retail_sales",
+              "retail_cancellations", "retail_adjustments"),
+  Description = c("Original data", "After removing exact duplicates",
+                  "Genuine product sales", "Cancellations of real products",
+                  "Non-product codes, reversed bulk orders, zero prices"),
+  Rows = c(nrow(retail_raw), nrow(retail_no_duplicates), nrow(retail_sales),
+           nrow(retail_cancellations), nrow(retail_adjustments))
+)
+kable(preparation_log, format.args = list(big.mark = ","),
+      caption = "Datasets created during preparation")
+```
+
+```{r validation}
+# Validation checks: compare each result with the expected value
+validation_table <- tibble(
+  Check = c("Exact duplicates remaining in retail_clean",
+            "Invoice dates that failed to convert",
+            "Zero or negative prices in retail_clean",
+            "Missing descriptions in retail_clean",
+            "Three datasets add up to all rows after deduplication"),
+  Result = c(sum(duplicated(retail_clean)),
+             sum(is.na(retail_no_duplicates$InvoiceDate)),
+             sum(retail_clean$UnitPrice <= 0),
+             sum(is.na(retail_clean$Description)),
+             ifelse(nrow(retail_no_duplicates) ==
+                      nrow(retail_sales) + nrow(retail_cancellations) + nrow(retail_adjustments),
+                    "Yes", "No")),
+  Expected = c("0", "0", "0", "0", "Yes")
+)
+kable(validation_table, caption = "Validation of the cleaned data")
+
+# Date coverage
+range(retail_clean$InvoiceDate)
+
+# Save the cleaned sales data for use in Power BI
+write_csv(retail_clean, "retail_clean_for_powerbi.csv")
+```
+
+```{r prep-numbers, include=FALSE}
+sales_revenue    <- sum(retail_sales$Revenue)
+cancelled_value  <- -sum(retail_cancellations$Revenue)
+sales_invoices   <- n_distinct(retail_sales$InvoiceNo)
+sales_customers  <- n_distinct(retail_sales$CustomerID, na.rm = TRUE)
+```
+
+The cleaned sales dataset contains `r format(nrow(retail_sales), big.mark = ",")` rows, with sales revenue of £`r format(round(sales_revenue), big.mark = ",")` from `r format(sales_invoices, big.mark = ",")` invoices and `r format(sales_customers, big.mark = ",")` identified customers. The data run from 1 December 2010 to 9 December 2011, so **December 2011 is an incomplete month**. Rows without a customer ID are kept for sales, product and country totals, and excluded only from customer-level analysis. Cancellations are kept in their own dataset rather than deleted, because objective 5 depends on them.
+
+### AI-Assisted
+
+I asked an AI assistant to review my cleaning code and the analysis built on it. It showed that non-product codes (such as postage) and two orders that were cancelled within minutes were still inside my sales data, which distorted the product, customer and cancellation results. I then reviewed these cases in the raw data, agreed with the decision to move them into a separate adjustments dataset, and checked that the three datasets add up to all rows. I wrote the original cleaning code, and decided which records to keep, remove or set aside.
+
+# Exploratory Data Analysis
+
+## Monthly sales trend
+
+```{r monthly-sales}
+monthly_sales <- retail_sales %>%
+  group_by(Month) %>%
+  summarise(Revenue  = sum(Revenue),
+            Quantity = sum(Quantity),
+            Orders   = n_distinct(InvoiceNo),
+            .groups  = "drop")
+
+ggplot(monthly_sales, aes(x = Month, y = Revenue, group = 1)) +
+  geom_line(colour = bar_colour) +
+  geom_point(colour = bar_colour) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Monthly sales revenue",
+       subtitle = "Revenue rises sharply from September and peaks in November",
+       caption = "December 2011 is incomplete (data ends on 9 December).",
+       x = NULL, y = "Revenue (£)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r monthly-table}
+monthly_sales %>%
+  arrange(desc(Revenue)) %>%
+  head(5) %>%
+  mutate(Revenue = round(Revenue)) %>%
+  kable(format.args = list(big.mark = ","), caption = "Five highest-revenue months")
+```
+
+```{r monthly-numbers, include=FALSE}
+top_month    <- monthly_sales$Month[which.max(monthly_sales$Revenue)]
+top_value    <- max(monthly_sales$Revenue)
+complete_months <- monthly_sales %>% filter(Month != "2011-12")   # December 2011 is incomplete
+low_month    <- complete_months$Month[which.min(complete_months$Revenue)]
+low_value    <- min(complete_months$Revenue)
+autumn_share <- sum(monthly_sales$Revenue[monthly_sales$Month %in% c("2011-09", "2011-10", "2011-11")]) /
+                sum(monthly_sales$Revenue) * 100
+rev_qty_cor  <- cor(monthly_sales$Revenue, monthly_sales$Quantity)
+```
+
+Revenue is highest in `r month_name(top_month)` (£`r format(round(top_value), big.mark = ",")`) and, among complete months, lowest in `r month_name(low_month)` (£`r format(round(low_value), big.mark = ",")`). September to November together generate `r round(autumn_share, 1)`% of all sales revenue. Revenue and units sold move together (correlation `r round(rev_qty_cor, 2)`), so the autumn peak comes mainly from higher volumes. December 2011 looks low only because the data stop on 9 December, so it should not be compared with complete months. Because only one year is available, the pattern cannot be confirmed as an annual cycle.
+
+## Product performance
+
+```{r products}
+product_sales <- retail_sales %>%
+  group_by(StockCode) %>%
+  summarise(Description = first(Description),
+            Revenue     = sum(Revenue),
+            Quantity    = sum(Quantity),
+            .groups     = "drop")
+
+top_revenue_products  <- product_sales %>% arrange(desc(Revenue))  %>% slice_head(n = 10)
+top_quantity_products <- product_sales %>% arrange(desc(Quantity)) %>% slice_head(n = 10)
+
+ggplot(top_revenue_products, aes(x = reorder(Description, Revenue), y = Revenue)) +
+  geom_col(fill = bar_colour) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Top 10 products by revenue", x = NULL, y = "Revenue (£)") +
+  theme_minimal()
+
+ggplot(top_quantity_products, aes(x = reorder(Description, Quantity), y = Quantity)) +
+  geom_col(fill = bar_colour) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Top 10 products by units sold", x = NULL, y = "Units sold") +
+  theme_minimal()
+```
+
+```{r product-numbers, include=FALSE}
+in_both        <- length(intersect(top_revenue_products$StockCode, top_quantity_products$StockCode))
+n_products     <- nrow(product_sales)
+products_80    <- sum(cumsum(sort(product_sales$Revenue, decreasing = TRUE)) /
+                      sum(product_sales$Revenue) <= 0.8) + 1
+top10_share    <- sum(top_revenue_products$Revenue) / sum(product_sales$Revenue) * 100
+```
+
+`r top_revenue_products$Description[1]` is the highest-revenue product (£`r format(round(top_revenue_products$Revenue[1]), big.mark = ",")`), while `r top_quantity_products$Description[1]` sells the most units (`r format(top_quantity_products$Quantity[1], big.mark = ",")`). Only `r in_both` of the top 10 products appear in both rankings, so the best-selling products by volume are not always the biggest earners, and both measures should be used when planning stock. Revenue is also concentrated: `r products_80` of the `r format(n_products, big.mark = ",")` products (`r round(products_80 / n_products * 100, 1)`%) generate 80% of sales revenue.
+
+## Country contribution
+
+```{r countries}
+country_sales <- retail_sales %>%
+  group_by(Country) %>%
+  summarise(Revenue   = sum(Revenue),
+            Orders    = n_distinct(InvoiceNo),
+            Customers = n_distinct(CustomerID, na.rm = TRUE),
+            .groups   = "drop") %>%
+  arrange(desc(Revenue)) %>%
+  mutate(Revenue_share_pct = round(Revenue / sum(Revenue) * 100, 1))
+
+country_sales %>%
+  head(10) %>%
+  mutate(Revenue = round(Revenue)) %>%
+  kable(format.args = list(big.mark = ","), caption = "Top 10 countries by sales revenue")
+
+# The UK is so large that it hides the other countries, so the chart excludes it
+country_sales %>%
+  filter(Country != "United Kingdom") %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(Country, Revenue), y = Revenue)) +
+  geom_col(fill = bar_colour) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Top 10 export markets by revenue (excluding the UK)",
+       x = NULL, y = "Revenue (£)") +
+  theme_minimal()
+```
+
+```{r country-aov}
+# Average order value by country. Countries with fewer than 20 orders are left out,
+# because an average based on a handful of orders is unreliable.
+country_sales %>%
+  filter(Orders >= 20) %>%
+  mutate(Average_Order_Value = round(Revenue / Orders)) %>%
+  arrange(desc(Average_Order_Value)) %>%
+  select(Country, Orders, Average_Order_Value) %>%
+  head(5) %>%
+  kable(format.args = list(big.mark = ","),
+        caption = "Highest average order values (countries with at least 20 orders)")
+```
+
+```{r country-numbers, include=FALSE}
+uk_share   <- country_sales$Revenue_share_pct[country_sales$Country == "United Kingdom"]
+non_uk     <- country_sales %>% filter(Country != "United Kingdom")
+top5_names <- non_uk$Country[1:5]
+top5_share <- sum(non_uk$Revenue_share_pct[1:5])
+```
+
+The United Kingdom generates `r uk_share`% of sales revenue. The next five markets (`r paste(top5_names, collapse = ", ")`) together contribute only `r round(top5_share, 1)`%, so the business depends heavily on its home market. Orders per country differ widely: some export markets earn a lot from few customers, so international opportunities should be judged on customers and order volume as well as revenue.
+
+## Customer behaviour
+
+```{r customers}
+customer_summary <- retail_sales %>%
+  filter(!is.na(CustomerID)) %>%
+  group_by(CustomerID) %>%
+  summarise(Orders  = n_distinct(InvoiceNo),
+            Revenue = sum(Revenue),
+            .groups = "drop") %>%
+  mutate(Average_Order_Value = Revenue / Orders) %>%
+  arrange(desc(Revenue))
+
+customer_summary %>%
+  head(10) %>%
+  mutate(Revenue = round(Revenue), Average_Order_Value = round(Average_Order_Value)) %>%
+  kable(format.args = list(big.mark = ","), caption = "Top 10 customers by revenue")
+
+# Average (mean) and typical (median) customer
+customer_summary %>%
+  summarise(Mean_orders = mean(Orders), Median_orders = median(Orders),
+            Mean_revenue = mean(Revenue), Median_revenue = median(Revenue),
+            Mean_AOV = mean(Average_Order_Value), Median_AOV = median(Average_Order_Value)) %>%
+  mutate(across(everything(), ~ round(.x, 1))) %>%
+  kable(format.args = list(big.mark = ","), caption = "Average versus typical customer")
+
+# Distribution of orders per customer (customers with up to 30 orders)
+customer_summary %>%
+  filter(Orders <= 30) %>%
+  ggplot(aes(x = Orders)) +
+  geom_histogram(binwidth = 1, fill = bar_colour) +
+  labs(title = "Most customers place only a few orders",
+       subtitle = "Customers with up to 30 orders shown",
+       x = "Number of orders", y = "Number of customers") +
+  theme_minimal()
+```
+
+```{r retention}
+# One-time versus repeat customers
+retention_summary <- customer_summary %>%
+  mutate(Customer_Type = ifelse(Orders == 1, "One-time customer", "Repeat customer")) %>%
+  group_by(Customer_Type) %>%
+  summarise(Customers = n(), .groups = "drop") %>%
+  mutate(Percentage = round(Customers / sum(Customers) * 100, 1))
+
+kable(retention_summary, format.args = list(big.mark = ","),
+      caption = "One-time versus repeat customers")
+```
+
+```{r customer-numbers, include=FALSE}
+n_customers   <- nrow(customer_summary)
+top20_n       <- round(0.2 * n_customers)
+top20_share   <- sum(customer_summary$Revenue[1:top20_n]) / sum(customer_summary$Revenue) * 100
+repeat_pct    <- retention_summary$Percentage[retention_summary$Customer_Type == "Repeat customer"]
+oneoff_pct    <- retention_summary$Percentage[retention_summary$Customer_Type == "One-time customer"]
+mean_revenue  <- mean(customer_summary$Revenue)
+median_revenue <- median(customer_summary$Revenue)
+```
+
+Customer revenue is highly concentrated: the top 20% of identified customers generate `r round(top20_share, 1)`% of sales revenue. The average customer spends £`r format(round(mean_revenue), big.mark = ",")`, but the typical (median) customer spends only £`r format(round(median_revenue), big.mark = ",")`, because a small number of very large buyers pull the average up. `r repeat_pct`% of customers ordered more than once, while `r oneoff_pct`% bought only once, which suggests a clear opportunity to turn first-time buyers into repeat customers.
+
+## Cancellations
+
+```{r cancellations}
+total_invoices     <- n_distinct(retail_clean$InvoiceNo)
+cancelled_invoices <- n_distinct(retail_cancellations$InvoiceNo)
+
+cancellation_summary <- tibble(
+  Measure = c("Cancellation invoices", "Cancellation rate (% of all invoices)",
+              "Cancelled value (£)", "Cancelled value as % of sales revenue"),
+  Value   = c(format(cancelled_invoices, big.mark = ","),
+              round(cancelled_invoices / total_invoices * 100, 1),
+              format(round(cancelled_value), big.mark = ","),
+              round(cancelled_value / sales_revenue * 100, 1))
+)
+kable(cancellation_summary, caption = "Cancellation summary")
+
+# Monthly cancellation rate = cancelled invoices / all invoices in that month
+monthly_cancellations <- retail_clean %>%
+  group_by(Month) %>%
+  summarise(Cancelled_Invoices = n_distinct(InvoiceNo[is_cancellation]),
+            Total_Invoices     = n_distinct(InvoiceNo),
+            Cancellation_Rate  = Cancelled_Invoices / Total_Invoices * 100,
+            .groups = "drop")
+
+ggplot(monthly_cancellations, aes(x = Month, y = Cancellation_Rate, group = 1)) +
+  geom_line(colour = bar_colour) +
+  geom_point(colour = bar_colour) +
+  labs(title = "Monthly cancellation rate",
+       x = NULL, y = "Cancelled invoices (% of all invoices)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Most frequently cancelled products
+retail_cancellations %>%
+  group_by(StockCode) %>%
+  summarise(Description = first(Description),
+            Units_cancelled = sum(abs(Quantity)),
+            Cancellation_lines = n(),
+            .groups = "drop") %>%
+  arrange(desc(Units_cancelled)) %>%
+  head(5) %>%
+  kable(format.args = list(big.mark = ","), caption = "Most cancelled products")
+```
+
+```{r cancel-numbers, include=FALSE}
+cancel_rate  <- cancelled_invoices / total_invoices * 100
+high_month   <- monthly_cancellations$Month[which.max(monthly_cancellations$Cancellation_Rate)]
+high_rate    <- max(monthly_cancellations$Cancellation_Rate)
+low_month    <- monthly_cancellations$Month[which.min(monthly_cancellations$Cancellation_Rate)]
+low_rate     <- min(monthly_cancellations$Cancellation_Rate)
+```
+
+`r format(cancelled_invoices, big.mark = ",")` invoices were cancellations, which is `r round(cancel_rate, 1)`% of all invoices, but they remove only `r round(cancelled_value / sales_revenue * 100, 1)`% of sales value, so cancellations are frequent but usually small. The monthly rate is highest in `r month_name(high_month)` (`r round(high_rate, 1)`%) and lowest in `r month_name(low_month)` (`r round(low_rate, 1)`%). The two reversed bulk orders were set aside during preparation; had they been left in, cancelled value would have been about twice as large.
+
+# Modelling: RFM Customer Segmentation
+
+RFM groups customers using three measures: **Recency** (days since the last purchase), **Frequency** (number of orders) and **Monetary value** (total revenue). Only customers with an ID are included. Each measure is scored from 1 to 5 using quintiles (`ntile()`), where 5 is best, and the scores are combined into segments.
+
+## Building the segments
+
+```{r rfm}
+# Reference date: the last transaction in the data
+reference_date <- max(retail_sales$InvoiceDate)
+
+rfm_data <- retail_sales %>%
+  filter(!is.na(CustomerID)) %>%
+  group_by(CustomerID) %>%
+  summarise(
+    Recency   = as.numeric(as.Date(reference_date) - as.Date(max(InvoiceDate))),
+    Frequency = n_distinct(InvoiceNo),
+    Monetary  = sum(Revenue),
+    .groups   = "drop"
+  )
+
+rfm_segments <- rfm_data %>%
+  mutate(
+    R_Score = ntile(desc(Recency), 5),   # recent customers score high
+    F_Score = ntile(Frequency, 5),
+    M_Score = ntile(Monetary, 5),
+    Segment = case_when(
+      R_Score >= 4 & F_Score >= 4 & M_Score >= 4 ~ "High Value",
+      R_Score <= 2 & F_Score >= 3                ~ "At Risk",
+      F_Score >= 4                               ~ "Loyal Customers",
+      R_Score >= 4                               ~ "Recent Customers",
+      TRUE                                       ~ "Others"
+    )
+  )
+
+segment_summary <- rfm_segments %>%
+  group_by(Segment) %>%
+  summarise(Customers = n(), Revenue = sum(Monetary), .groups = "drop") %>%
+  mutate(Customer_pct = round(Customers / sum(Customers) * 100, 1),
+         Revenue_pct  = round(Revenue / sum(Revenue) * 100, 1)) %>%
+  arrange(desc(Revenue))
+
+segment_summary %>%
+  mutate(Revenue = round(Revenue)) %>%
+  kable(format.args = list(big.mark = ","), caption = "RFM customer segments")
+```
+
+```{r rfm-chart}
+# Share of customers compared with share of revenue, side by side
+segment_summary %>%
+  select(Segment, `Share of customers` = Customer_pct, `Share of revenue` = Revenue_pct) %>%
+  pivot_longer(-Segment, names_to = "Measure", values_to = "Percent") %>%
+  ggplot(aes(x = reorder(Segment, Percent), y = Percent, fill = Measure)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Share of customers" = "grey70", "Share of revenue" = bar_colour)) +
+  labs(title = "Customer segments: share of customers versus share of revenue",
+       x = NULL, y = "Percent", fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+## Interpretation
+
+```{r rfm-numbers, include=FALSE}
+hv     <- segment_summary %>% filter(Segment == "High Value")
+atrisk <- segment_summary %>% filter(Segment == "At Risk")
+others <- segment_summary %>% filter(Segment == "Others")
+```
+
+**High Value** customers are `r hv$Customer_pct`% of identified customers but generate `r hv$Revenue_pct`% of segment revenue, so retaining them is the top priority. The **Others** segment is the largest group (`r others$Customer_pct`% of customers) but contributes only `r others$Revenue_pct`% of revenue. `r format(atrisk$Customers, big.mark = ",")` customers are **At Risk**: they bought regularly in the past but not recently, so they are the best target for re-engagement. Quintile scores split customers with identical values (for example, many customers have exactly one order) between score bands, so segment sizes are indicative rather than exact.
+
+### AI-Assisted
+
+I asked an AI assistant to help structure the RFM segmentation and check the segment results. It suggested comparing each segment's share of customers with its share of revenue, which makes the concentration of value easy to see, and it warned that quintile scoring is arbitrary when many customers share the same frequency. I chose the segment rules and interpreted what each segment means for retention.
+
+# Evaluation and Business Recommendations
+
+## Findings and recommendations
+
+| Area | Key finding | Recommendation |
+|------|-------------|----------------|
+| Sales trend | September to November generate `r round(autumn_share, 1)`% of sales revenue; `r month_name(top_month)` is the peak | Plan stock, staffing and marketing around the autumn peak, and review demand in early months |
+| Products | `r products_80` products (`r round(products_80 / n_products * 100, 1)`%) generate 80% of revenue; revenue and volume rankings differ | Protect availability of top products and review pricing of high-volume, low-revenue items |
+| Countries | The UK generates `r uk_share`% of revenue; the next five markets add only `r round(top5_share, 1)`% | Keep strengthening the UK while testing growth in the largest export markets |
+| Customers | The top 20% of customers generate `r round(top20_share, 1)`% of revenue; `r oneoff_pct`% buy only once | Reward and retain High Value customers; send follow-up offers to first-time buyers |
+| Segments | High Value customers are `r hv$Customer_pct`% of customers but `r hv$Revenue_pct`% of revenue | Personalised offers for High Value customers and a win-back campaign for At Risk customers |
+| Cancellations | `r round(cancel_rate, 1)`% of invoices are cancellations, worth `r round(cancelled_value / sales_revenue * 100, 1)`% of sales | Monitor monthly rates and check unusually large orders before dispatch |
+| Data quality | `r pct_missing_cid`% of raw rows have no customer ID | Capture the customer ID at every checkout so more sales can be linked to customers |
+
+### AI-Assisted
+
+I used an AI assistant to help turn the findings into recommendations and to condense this report into a clear structure. I checked that every figure in the findings table comes from my own results, and I decided which recommendations were realistic for this business.
+
+## Limitations
+
+- **Missing customer IDs:** customer analysis covers identified customers only.
+- **One year of data:** seasonality cannot be confirmed across years, and December 2011 is incomplete.
+- **No cost data:** revenue is not profit, so the highest-revenue customers may not be the most profitable.
+- **Cancellations** are not linked to the original orders, and the reason for each is unknown.
+- **RFM scoring** is exploratory: quintile scores and segment rules are judgements, not externally validated labels.
